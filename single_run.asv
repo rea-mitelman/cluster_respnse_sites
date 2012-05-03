@@ -1,0 +1,414 @@
+
+% This function runs over all directories containing the data recorded. For
+% each subsession with SCP stimulation in amplitude stim_amp, in a depth
+% under depth_thresh. The median response vectors (to SCP stimulation),
+% starting at t=resp_dur(1) and ending at t=resp_dur(2) are binned to
+% guess filt length millisecond bins.
+% The response vectors themselves are called by the function
+% get_resp_vec_fast, and they are saved in the root dir.
+% Next, all responses vectors in each location (thalamus, cortex) are again
+% removed of the artifact leftovers and decomposed using SVD to d=3
+% dimensions and sorted using EM algorithm into 3 gaussians. The center of
+% the Gaussian closest to zero is considered the non-responsive loci.
+% Finally, the responsiveness flags (responsive - true/false) are saved in
+% the info file.
+
+
+clear all;
+stim_amp=300; %minimum stim amplitude to take
+stim_config='mono';
+depth_thresh=8;
+thal_min_threshold=1; %minimum amplitude needed in mesure in order to save it
+ctx_min_threshold=3.5; %minimum amplitude needed in mesure in order to save it
+
+highpass_f = 3; %in Khz
+method = 1; %using mad and median
+gauss_win_time  = 0.2; % in ms;
+signal_power = 1; %taking the abs of signal
+is_ica = 2; %use ICA
+d = 3; %num if pcs used
+K=3; %number of clusters
+do_plot=true; %plot results in the end
+
+
+replicates = 2000;
+
+
+resp_dur=[-20,50];%[time_begin time_end] of the response vector, in ms
+do_mean=false;%do_mean==true => use median and MAD indtead of mean and STD
+if ~unempty_exist('root_dir')
+    %root_dir='D:\hugo_data\HugoData-CtxThl on 132.64.163.150';
+    %     root_dir='C:\rotem\hugo_data\HugoData-CtxThl on 132.64.163.150';
+    root_dir='G:\users\ream\Prut\Yolanda\Data\YolandaData\';
+end
+% function build_resp_site_db
+% this function builds a data base of all sub-session of all electrodes, and
+% calculate their responsiveness to SCP stimulation
+all_depths=[];
+sessions = dir(root_dir);
+all_resp.ctx=[];all_resp.thal=[];
+counter.ctx=0;counter.thal=0;
+all_resp_id.ctx=[];all_resp_id.thal=[];
+ctx_counter=1;
+thal_counter=1;
+not_taken=0;
+
+%for i_sess=1:11
+for i_sess=1:length(sessions)
+    if ~sessions(i_sess).isdir
+        continue
+    end
+    
+    %get info file data
+    [SESSparam, DDFparam, MAT_base_name, curr_MrgEd_dir, curr_mat_dir, this_sess_infofile]=get_info(root_dir, sessions(i_sess).name);
+    
+    if isempty(SESSparam)
+        continue
+    end
+    
+    
+    %find the relevant raw data directory
+    MrgEd_base_name=[MAT_base_name(1) num2str(DDFparam.ID)];
+    monkey_let=MrgEd_base_name(1);
+    for i_ss=1:length(SESSparam.SubSess)
+        all_files=SESSparam.SubSess(i_ss).Files(1):SESSparam.SubSess(i_ss).Files(2);
+            if monkey_let=='h'
+                try
+                    stim_files=getfilenums(SESSparam.SubSess(i_ss));
+                catch
+                    stim_files=all_files;
+                end
+                max_stim_amp = max(SESSparam.SubSess(i_ss).GlobalStim.AmpMat);
+            elseif monkey_let=='y'
+                stim_files=[];
+                for i_file=all_files
+                    if SESSparam.fileConfig(i_file).SCPStim && isequal(str2num(SESSparam.fileConfig(i_file).SCPStimAmp),stim_amp) &&...
+                            ~isempty(findstr(SESSparam.fileConfig(i_file).SCPConfig,stim_config))
+                            stim_files=[stim_files i_file];
+                            
+                    end
+                end
+            else
+                error('Wrong monkey letter, %s',monkey_let)
+            end
+        
+        for i_file=stim_files
+            ii = find(i_file==all_files);
+            clear AMstim AMstim_on StimTime Unit*
+            [MrgEd_filename,wvf_filename,bhv_filename] = ...
+                get_load_filenames(curr_MrgEd_dir,MrgEd_base_name,i_ss,i_file,curr_mat_dir,MAT_base_name, i_file);
+            load(wvf_filename,'Unit*'); load(bhv_filename,'*tim*');
+            
+            [stim_times,stim_times_Fs] = get_stim_times;
+            
+            if isempty(stim_times), continue, end
+            
+            if monkey_let=='h'
+                do_site = isfield(SESSparam.SubSess(i_ss),'GlobalStim') && isfield(SESSparam.SubSess(i_ss).GlobalStim,'AmpMat') &&...
+                    ~isempty(SESSparam.SubSess(i_ss).GlobalStim.AmpMat) && SESSparam.SubSess(i_ss).GlobalStim.AmpMat(ii)==max_stim_amp && max_stim_amp>=stim_amp;
+            elseif monkey_let=='y'
+                do_site = true; %The terms were checked in line ***
+            end
+            
+            if do_site
+                if isfield(DDFparam,'Electrode')
+                    elecs=1:length(DDFparam.Electrode);
+                    four_elec=true;
+                else %this section hendles the few cases of two electrodes that were in use in a few cases with the old data type.
+                    elecs=1:2;
+                    elec_fields={'SR','SL'}; %according to the pages, Unit1 is right and Unit2 is left
+                    elec_glob_fields={'SpinalRight','SpinalLeft'};
+                    four_elec=false;
+                end
+                
+                for elec=elecs
+                    %                     if four_elec && ~DDFparam.Electrode(elec).InUse, continue, end
+                    dont_save_flag=false;
+                    if four_elec
+                        org_vec =eval(DDFparam.Electrode(elec).Channel);
+                        
+                        
+                        [resp_vec,t] = get_resp_vec_fast(eval(DDFparam.Electrode(elec).Channel), ...
+                            eval([DDFparam.Electrode(elec).Channel '_KHz']), stim_times,stim_times_Fs,resp_dur,highpass_f,signal_power,method,gauss_win_time);
+                    else
+                        if ~exist(['Unit' num2str(elec)],'var')
+                            continue
+                        end
+                        org_vec = eval(['Unit' num2str(elec)]);
+                        
+                        resp_vec = get_resp_vec_fast(eval(['Unit' num2str(elec)]), ...
+                            eval(['Unit' num2str(elec) '_KHz']), stim_times,stim_times_Fs,resp_dur,highpass_f,signal_power,method,gauss_win_time);
+                    end
+                    
+                    if any(isnan(resp_vec))
+                        disp('Warning, NaNs in the response vector')
+                        beep
+                        keyboard
+                    end
+                    
+                    
+                    if four_elec
+                        this_depth=SESSparam.SubSess(i_ss).Electrode(elec).Depth ;
+                        all_depths=[all_depths this_depth];
+                        if  this_depth < depth_thresh
+                            loc='ctx';
+                            if max(org_vec)<ctx_min_threshold
+                                dont_save_flag=true;
+                            end
+                            
+                            ctx_max_v(ctx_counter)=max(org_vec);
+                            ctx_counter=ctx_counter+1;
+                            
+                        else
+                            loc='thal';
+                            if max(org_vec)<thal_min_threshold
+                                dont_save_flag=true;
+                            end
+                            thal_max_v(ctx_counter)=max(org_vec);
+                            thal_counter=ctx_counter+1;
+                            
+                        end
+                    else
+                        try
+                            this_depth = SESSparam.SubSess(i_ss).(elec_fields{elec}).Depth - DDFparam.(elec_glob_fields{elec}).Cell1st;
+                            
+                        catch
+                            this_depth=NaN;
+                            disp('Warning, probably single electrode session with discrepancy, session ignored')
+                            beep
+                            keyboard
+                        end
+                        if this_depth < depth_thresh
+                            loc='ctx';
+                            if max(org_vec)<ctx_min_threshold
+                                dont_save_flag=true;
+                            end
+                            
+                            ctx_max_v(ctx_counter)=max(org_vec);
+                            ctx_counter=ctx_counter+1;
+                        elseif this_depth >= depth_thresh
+                            loc='thal';
+                            if max(org_vec)<thal_min_threshold
+                                dont_save_flag=true;
+                            end
+                            thal_max_v(ctx_counter)=max(org_vec);
+                            thal_counter=ctx_counter+1;
+                        end
+                        
+                    end %if four_elec
+                    %                     all_resp.(loc)=[all_resp.(loc),resp_vec];
+                    if dont_save_flag==false;
+                        if do_plot
+                            v=resp_vec;
+                            %v(-2<t & t<1)=NaN;
+                            plot(t,v);
+                            suptitle(sprintf('Session: %1.0f, Subsession: %1.0f, File: %1.0f, Electrode %1.0f', ...
+                                DDFparam.ID, i_ss, i_file, elec));
+                        end
+                        counter.(loc)=counter.(loc)+1;
+                        all_resp.(loc)(:,counter.(loc))=resp_vec;
+                        all_resp_id.(loc)(counter.(loc)).info_file=this_sess_infofile;
+                        all_resp_id.(loc)(counter.(loc)).ss=i_ss;
+                        all_resp_id.(loc)(counter.(loc)).is_4_elect=four_elec;
+                        all_resp_id.(loc)(counter.(loc)).elec=elec;
+                    else
+                        not_taken=not_taken+1;
+                    end
+                    
+                    
+                    %                     pause
+                end %                for elec=1:elecs
+                
+            end
+        end %for i_file = ...
+        
+        %call is_resp_site
+        
+        %db_file(correct location)=resp_index
+        
+    end %for i_ss = ...
+    
+end
+save ('test_resp_med_mu_gauss_02', 'all_resp', 'all_resp_id' , 't')
+
+
+
+
+
+
+
+
+load('test_resp_med_mu');
+locs={'thal','ctx'};
+
+
+cols=['rgbcmyk'];
+for i_locs=1:2
+    %     clear St
+    %     dat_mat = dat.med.all_resp.(locs{i_locs});
+    dat_mat = all_resp.(locs{i_locs});
+    dat_mat(t<1.2,:)=0;
+    dat_mat(t>30,:)=0;
+    if is_ica == 1
+        [U,~,V] = svds(dat_mat,d);
+    else
+        [U,~,V] = fastica(dat_mat','numOfIC',d,'lastEig',d);
+        U = U';
+        V = V';
+    end
+    
+    
+    [~,ix_sort]=sort(abs(V));
+    
+    opts_obj.MaxIter=200;
+    %try
+    obj = gmdistribution.fit(V,K,'Replicates',replicates,'Options',opts_obj);
+    
+    IDX = cluster(obj,V);
+    groups{i_locs}=IDX;
+    [~,sort_clust_ixs]=sort(sum(obj.mu.^2,2).^.5);
+    sort_clust_ixs=sort_clust_ixs';
+    resp_sites_vec.(locs{i_locs})=true(size(IDX));
+    resp_sites_vec.(locs{i_locs})(IDX==sort_clust_ixs(1))=false;
+    if do_plot
+        figure
+        subplot(2,2,1)
+        hold on
+        for j=1:K
+            kk=sort_clust_ixs(j);
+            if d>3
+                hold all
+                for ppp=1:d
+                    plot(V(IDX==kk,ppp),ones(sum(IDX==kk),1)*ppp,['.' cols(j)]);
+                end
+            elseif d==3
+                plot3(V(IDX==kk,1),V(IDX==kk,2),V(IDX==kk,3),['.' cols(j)]);
+            elseif d==2
+                plot(V(IDX==kk,1),V(IDX==kk,2),['.' cols(j)]);
+            else
+                plot(ones(sum(IDX==kk),1),V(IDX==kk),['.' cols(j)]);
+            end
+        end
+        
+        title('Projection on PCs, sorted by EM')
+        subplot(2,2,3)
+        plot(t,U)
+        xlabel('Time (msec)')
+        title('PCs')
+        %legend(num2cell(num2str([1:d]')))
+        %         suptitle(sprintf('%s activity in %s, %g clusters based on %g PCs',med,locs{i_locs},K,d));
+        for j=1:K
+            kk=sort_clust_ixs(j);
+            subplot(K,2,2*j)
+            %             this_mat=dat_mat(:,IDX==j);
+            %             this_mat=repmat(2*[0:size(this_mat,2)-1],size(this_mat,1),1)+this_mat;
+            %             plot(t,this_mat)
+            %             ylim([-inf inf])
+            plot(t,dat_mat(:,IDX==kk),cols(j))
+            
+            if j==1
+                tit='Clustered as non-responsive';
+            else
+                tit=sprintf('Clustered as type %g response',j-1);
+            end
+            title(sprintf('%s, %g sites',tit,sum(IDX==kk)))
+            ylabel('# MADs from Median')
+            if j==K
+                xlabel('Time (msec)')
+            end
+        end
+    end
+end
+    
+    
+    %save ('scores', 'all_space_scores');
+    
+    
+    
+    
+    
+    
+    %% now, run over all the sites,
+    % in each site save the response index, i.e. 0 if
+    % and save in each of the correct data file the correct response index (responsive / not responsive)
+  
+    IDs_mu = {};
+    ID_place_mu = [];
+   counter = 1;
+for i_locs=1:2
+    loc=locs{i_locs};
+    n_sites=length(all_resp_id.(loc));
+    for i_site=1:n_sites
+        file_info=all_resp_id.(loc)(i_site).info_file;
+        ss=all_resp_id.(loc)(i_site).ss;
+        elec=all_resp_id.(loc)(i_site).elec;
+        resp=resp_sites_vec.(locs{i_locs})(i_site);
+        l=load(file_info,'SESSparam');
+        all_resp_id.(loc)(i_site).group=groups{i_locs}(i_site);
+        IDX_mu(counter)=groups{i_locs}(i_site);
+        IDs_mu{counter} = [file_info ' ss: ' num2str(ss) ' elec: ' num2str(elec)];
+        %ID_LFP_group(counter)=groups{i_locs}(i_site);
+        ID_place_mu(counter,1) = i_locs;
+        ID_place_mu(counter,2) = i_site;
+        counter=counter+1;
+    end
+end
+save('group_IDs_mu','IDs_mu','ID_place_mu','all_resp_id_mu','IDX_mu');    
+
+
+
+
+
+    
+    for i_locs=1:1
+        loc=locs{i_locs};
+        n_sites=counter.(loc);
+        for i_site=1:n_sites
+            file_info=all_resp_id.(loc)(i_site).info_file;
+            ss=all_resp_id.(loc)(i_site).ss;
+            elec=all_resp_id.(loc)(i_site).elec;
+            resp=resp_sites_vec.(locs{i_locs})(i_site);
+            l=load(file_info,'SESSparam');
+            
+            if all_resp_id.(loc)(i_site).is_4_elect %4 electrodes format
+                if isfield(l.SESSparam.SubSess(ss).Electrode(elec),'responsive') && ...
+                        ~isempty(l.SESSparam.SubSess(ss).Electrode(elec).responsive) && ...
+                        ~isequal(l.SESSparam.SubSess(ss).Electrode(elec).responsive,resp)
+                    disp('This site already contains a responsive flag which is different than currently calculated')
+                    keyboard
+                else
+                    l.SESSparam.SubSess(ss).Electrode(elec).responsive = resp;
+                    save (file_info, '-struct','l', '-append');
+                    
+                end
+                
+            else %old, two electrodes format
+                if isfield(l.SESSparam.SubSess(ss).(elec_fields{elec}),'responsive') && ...
+                        ~isempty(l.SESSparam.SubSess(ss).(elec_fields{elec}).responsive) && ...
+                        ~isequal(l.SESSparam.SubSess(ss).(elec_fields{elec}).responsive,resp)
+                    disp('This site already contains a responsive flag which is different than currently calculated')
+                    keyboard
+                else
+                    l.SESSparam.SubSess(ss).(elec_fields{elec}).responsive = resp;
+                    save (file_info, '-struct','l', '-append');
+                end
+            end
+        end
+    end
+    
+    for rounds = 1:100
+        opts_obj.MaxIter=20000;
+        log_flag=1;
+        try
+            obj = gmdistribution.fit(V,K,'Replicates',1,'Options',opts_obj);
+        catch
+            all_nlog3(rounds)=NaN;
+            log_flag=0;
+            continue
+        end
+        if log_flag==1
+            all_nlog3(rounds)=obj.NlogL;
+        end
+    end
+    
+    
